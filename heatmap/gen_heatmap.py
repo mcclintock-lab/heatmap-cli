@@ -4,6 +4,8 @@ import rasterio
 from rasterio.features import bounds, rasterize
 from rasterio.enums import MergeAlg
 from rasterio.crs import CRS
+from rasterio.transform import Affine
+from rasterio.windows import from_bounds
 import rasterio.shutil
 from shapely.geometry import shape, box, Polygon, MultiPolygon
 import fiona
@@ -14,6 +16,43 @@ from .reprojectFeature import reprojectPolygon
 from .calc_raster_props import calcRasterProps
 from .calc_sap import calcSap
 from .shapeIndex import calcShapeIndex, calcPolygonShapeIndex
+
+def countRasterCells(geometry, transform, width, height, all_touched=False):
+  """Count output raster cells a geometry would cover under the given rasterize mode.
+
+  Uses a window clipped to the geometry bounds (padded by 1 pixel for ALL_TOUCHED
+  edges) so counting does not allocate a full-size raster per shape.
+  """
+  geom = shape(geometry) if isinstance(geometry, dict) else geometry
+  minx, miny, maxx, maxy = geom.bounds
+  window = from_bounds(minx, miny, maxx, maxy, transform)
+
+  row_off = int(math.floor(window.row_off)) - 1
+  col_off = int(math.floor(window.col_off)) - 1
+  row_end = int(math.ceil(window.row_off + window.height)) + 1
+  col_end = int(math.ceil(window.col_off + window.width)) + 1
+
+  row_off = max(0, row_off)
+  col_off = max(0, col_off)
+  row_end = min(height, row_end)
+  col_end = min(width, col_end)
+
+  win_height = row_end - row_off
+  win_width = col_end - col_off
+  if win_height <= 0 or win_width <= 0:
+    return 0
+
+  window_transform = transform * Affine.translation(col_off, row_off)
+  mask = rasterize(
+    [(geom, 1)],
+    out_shape=(win_height, win_width),
+    transform=window_transform,
+    fill=0,
+    all_touched=all_touched,
+    dtype='uint8'
+  )
+  return int(mask.sum())
+
 
 def genHeatMap(
   infile,
@@ -44,13 +83,13 @@ def genHeatMap(
     method: method for calculating value: count, area, sap. Defaults to sap
     importanceField: name of vector attribute containing importance value used for SAP calculation
     importanceFactorField: name of vector attribute containing importanceFactor value for importance
-    areaFactor: factor to change the area by dividing. For example if area of geometry is calculated in square meters, an areaFactor of 1,000,000 will make the SAP per square km. because 1 sq. km = 1000m x 1000m = 1mil sq. meters 
+    areaFactor: factor to change the area by dividing. Area is overlapped raster cell coverage (cell count × cell area). For example if cell area is in square meters, an areaFactor of 1,000,000 will make the SAP per square km. because 1 sq. km = 1000m x 1000m = 1mil sq. meters 
     uniqueIdField: field containing a unique Id for feature to use for logging the list of features included in the raster for verification.  Must not allow person to be re-identified
     outCrsString: the epsg code for the output raster coordinate system, defaults to epsg:3857 aka Web Mercator
     outResolution: length/width of planning unit in units of output coordinate system, defaults to 1000 (1000m = 1km)
     bounds: bounds to use for output raster, as [w, s, e, n] in CRS of infile.  Output raster will align to the top left, but will extend past the bottom right as needed to the next multiple of outResolution
     boundsPrecision: number of digits to round the coordinates of bound calculation to. useful if don't snap to numbers as expected
-    allTouchedSmall: (boolean) use allTouched rasterize option for shapes with smaller shape index than a raster cell (area/perimeter length).  Ensures small and narrow shapes are not lost and every shape contributes heat to at least one pixel in result. Larger shapes are still picked up using Bresenham’s line algorithm because allTouched creates some seemingly invalid output (double counting) along shape boundaries. Using allTouched only for smallest shapes that need it mitigates this, but also uses additional memory, and will also carry more weight than shapes just above the index threshold.
+    allTouchedSmall: (boolean) use allTouched rasterize option for shapes with smaller shape index than a raster cell (area/perimeter length).  Ensures small and narrow shapes are not lost and every shape contributes heat to at least one pixel in result. Larger shapes are still picked up using Bresenham’s line algorithm because allTouched creates some seemingly invalid output (double counting) along shape boundaries. Using allTouched only for smallest shapes that need it mitigates this, but also uses additional memory. SAP and area methods always use overlapped raster cell area (cell count × cell area) rather than vector geometry area, counting cells with the same allTouched setting used to burn the shape.
     allTouchedSmallFactor: (number) use to increase the shapeIndex threshold for identifying small shapes.  shapeIndex threshold is calculated as (shapeIndex of a raster cell * allTouchedSmallFactor).  Defaults to 1.25.  Increasing the factor will identify increasingly larger shapes as "small" and to be run with AllTouched option.  Useful when you have polygons that are mostly large but have small areas that are long and narrow and thus spotty in being picked up
     fixGeom: if an invalid geometry is found, if fixGeom is True it attempts to fix using buffer(0), otherwise it fails.  Review the log to make sure the automated fix was acceptable
     logToFile: (boolean) whether to output logs, errors, and manifest to file or stdout
@@ -141,6 +180,23 @@ def genHeatMap(
   # Can be used to identify small shapes that might not be picked up by the standard
   # rasterize function which uses painters algorithm (shape must cross centerpoint of raster cell)
   shapeIndexThreshold = calcShapeIndex(inBounds, outResolution, allTouchedSmallFactor)
+  cellArea = outResolution ** 2
+
+  def heatValueFromCellCount(nCells):
+    rasterArea = max(nCells, 1) * cellArea
+    if method == 'area':
+      return 1 / rasterArea
+    elif method == 'sap':
+      return calcSap(
+          shapeGeom,
+          feature['properties'][importanceField] if importanceField else 1,
+          areaFactor,
+          feature['properties'][importanceFactorField] if importanceFactorField else 1,
+          maxArea,
+          maxSap,
+          area=rasterArea
+        )
+    return 1 # count method
 
   for idx, feature in enumerate(src_shapes):
       # Convert to shapely Polygon/MultiPolygon with reproject if necessary
@@ -155,6 +211,7 @@ def genHeatMap(
         uniqueId = idx
 
       error = False
+      heatValue = None
       # If shape is invalid, attempt to fix it, otherwise log it and move on
       if not shapeGeom.is_valid:
         if fixGeom:
@@ -170,6 +227,7 @@ def genHeatMap(
             }))
             log.append("")     
             shapeGeom = fixedGeom
+            geometry = shapeGeom.__geo_interface__
             if uniqueIdField:
               manifest['fixed'].append(feature['properties'][uniqueIdField])
             else:
@@ -185,21 +243,8 @@ def genHeatMap(
       elif len(geometry['coordinates'][0]) == 0:
         error = "Geometry has no coordinates"
 
-      # Calculate heat value
+      # Classify small vs large, count overlapped cells, then calculate heat from cell area
       if not error:
-        heatValue = 1 # count method
-        if method == 'area':
-          heatValue = 1 / shapeGeom.area
-        elif method == 'sap':
-          heatValue = calcSap(
-              shapeGeom,
-              feature['properties'][importanceField] if importanceField else 1,
-              areaFactor,
-              feature['properties'][importanceFactorField] if importanceFactorField else 1,
-              maxArea,
-              maxSap
-            )
-
         # Split shapes into two groups based on whether their shape index is above or below threshold
         # Threshold is based on the size of one raster cell
         # Shapes below threshold are considered small and will have the all_touched algorithm applied
@@ -208,20 +253,28 @@ def genHeatMap(
         # line artifacts for larger shapes that are incorrect. Using only on small minimizes that affect
 
         if (geometry["type"] == "Polygon"):
-          # Calculate shape index of polygon and see if smaller than threshold
           polygonShapeIndex = calcPolygonShapeIndex(shapeGeom)
           isSmall = allTouchedSmall and polygonShapeIndex < shapeIndexThreshold
+          nCells = countRasterCells(shapeGeom, outTransform, width, height, all_touched=isSmall)
+          heatValue = heatValueFromCellCount(nCells)
           if (isSmall):
             smallShapes.append((geometry, heatValue))
           else:
             shapes.append((geometry, heatValue))
         elif (geometry["type"] == "MultiPolygon"):
           # If multipolygon, split up into individual polygons so that small pieces bin accordingly
+          # One SAP per feature: sum cell counts across parts, then apply that heat value to each
           polys = list(shapeGeom.geoms)
-          print('Splitting multipolygon {0} into {1} pieces and applying heat value {2} to each'.format(uniqueId, len(polys), heatValue))
+          parts = []
+          totalN = 0
           for p in polys:
             polygonShapeIndex = calcPolygonShapeIndex(p)
             isSmall = allTouchedSmall and polygonShapeIndex < shapeIndexThreshold
+            totalN += countRasterCells(p, outTransform, width, height, all_touched=isSmall)
+            parts.append((p, isSmall))
+          heatValue = heatValueFromCellCount(totalN)
+          print('Splitting multipolygon {0} into {1} pieces and applying heat value {2} to each'.format(uniqueId, len(polys), heatValue))
+          for p, isSmall in parts:
             if (isSmall):
               smallShapes.append((MultiPolygon([p]).__geo_interface__, heatValue))
             else:
