@@ -1,4 +1,4 @@
-def calcSap(geometry, importance=1, areaFactor=1, importanceFactor=1, maxArea=None, maxSap=None, area=None):
+def calcSap(geometry, importance=1, areaFactor=1, importanceFactor=1, maxArea=None, maxSap=None, area=None, areaFloor=None):
   """Core algorithm, calculates the spatial access priority (SAP) value for a single area
 
   Each respondent has a total SAP of 100, and each shape is assigned a portion
@@ -18,11 +18,17 @@ def calcSap(geometry, importance=1, areaFactor=1, importanceFactor=1, maxArea=No
     maxArea: limits the area of a shape in SAP calculation.  Gives shapes with high area an artifically lower one, increasing their SAP relative to others, increasing their presence in heatmap
     maxSap: limits the SAP value. Gives shapes with high priority an artificially lower one, decreasing their presence in heatmap
     area: overlapped raster cell area in the same units as geometry.area.  When omitted, geometry.area is used
+    areaFloor: minimum area in square meters (same units as geometry.area / cell area).  Calculated areas below this are raised to the floor before areaFactor, decreasing their SAP.  Does not change the geometry and is not used to classify small shapes.
   Returns:
     SAP value for shape
   """
   
-  area = (geometry.area if area is None else area) / areaFactor
+  area = geometry.area if area is None else area
+
+  if (areaFloor):
+    area = max(area, areaFloor)
+
+  area = area / areaFactor
   
   if (maxArea):
     area = min(area, maxArea)

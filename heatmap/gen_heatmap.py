@@ -72,6 +72,7 @@ def genHeatMap(
   fixGeom=False,
   maxArea=None,
   maxSap=None,
+  areaFloor=None,
   logToFile=False,
 ):
   """Generates Spatial Access Priority (SAP) raster map given run configuration
@@ -92,7 +93,10 @@ def genHeatMap(
     allTouchedSmall: (boolean) use allTouched rasterize option for shapes with smaller shape index than a raster cell (area/perimeter length).  Ensures small and narrow shapes are not lost and every shape contributes heat to at least one pixel in result. Larger shapes are still picked up using Bresenham’s line algorithm because allTouched creates some seemingly invalid output (double counting) along shape boundaries. Using allTouched only for smallest shapes that need it mitigates this, but also uses additional memory. SAP and area methods always use overlapped raster cell area (cell count × cell area) rather than vector geometry area, counting cells with the same allTouched setting used to burn the shape.
     allTouchedSmallFactor: (number) use to increase the shapeIndex threshold for identifying small shapes.  shapeIndex threshold is calculated as (shapeIndex of a raster cell * allTouchedSmallFactor).  Defaults to 1.25.  Increasing the factor will identify increasingly larger shapes as "small" and to be run with AllTouched option.  Useful when you have polygons that are mostly large but have small areas that are long and narrow and thus spotty in being picked up
     fixGeom: if an invalid geometry is found, if fixGeom is True it attempts to fix using buffer(0), otherwise it fails.  Review the log to make sure the automated fix was acceptable
-    logToFile: (boolean) whether to output logs, errors, and manifest to file or stdout
+    maxArea: limits the area of a shape in SAP calculation after areaFactor. Gives shapes with high area an artificially lower one, increasing their SAP
+    areaFloor: minimum overlapped cell area in square meters. Calculated areas below this are raised to the floor before areaFactor, decreasing their SAP. Does not affect allTouchedSmall classification, which uses vector shape index only.
+    maxSap: limits the SAP value. Gives shapes with high priority an artificially lower one, decreasing their presence in heatmap
+    logToFile: (boolean) whether to write the .log.txt and .error.geojson and skip printing the full manifest to stdout. The .manifest.json is always written next to the output GeoTIFF.
 
   Returns:
     Manifest of run
@@ -121,13 +125,14 @@ def genHeatMap(
   if outPath is None:
     inBasename = os.path.join(inpath, inFilename)    
   else:
+    os.makedirs(outPath, exist_ok=True)
     inBasename = os.path.join(outPath, inFilename)
 
   outfile = "{}.tif".format(inBasename)
   outfileSmall = "{}_small.tif".format(inBasename)
   outfileLarge = "{}_large.tif".format(inBasename)
   logfile = "{}.log.txt".format(inBasename) if logToFile else None
-  manifestfile = "{}.manifest.json".format(inBasename) if logToFile else None
+  manifestfile = "{}.manifest.json".format(inBasename)
   errorfile = "{}.error.geojson".format(inBasename) if logToFile else None
 
   if os.path.exists(outfile) and not overwrite:
@@ -152,6 +157,9 @@ def genHeatMap(
       'bounds': bounds,
       'boundsPrecision': boundsPrecision,
       'allTouchedSmall': allTouchedSmall,
+      'maxArea': maxArea,
+      'areaFloor': areaFloor,
+      'maxSap': maxSap,
     },
     'included': [],
     'includedSmall': [],
@@ -175,6 +183,8 @@ def genHeatMap(
   shapes = []
   # Special handle shapes smaller than an output pixel
   smallShapes = []
+  # Parallel to `included`: (uniqueId, heatValue) for ALL_TOUCHED shapes
+  smallIncluded = []
 
   # Calculate shape index of one raster pixel.  Shape index = pixel area / pixel length
   # Can be used to identify small shapes that might not be picked up by the standard
@@ -185,6 +195,8 @@ def genHeatMap(
   def heatValueFromCellCount(nCells):
     rasterArea = max(nCells, 1) * cellArea
     if method == 'area':
+      if areaFloor:
+        rasterArea = max(rasterArea, areaFloor)
       return 1 / rasterArea
     elif method == 'sap':
       return calcSap(
@@ -194,7 +206,8 @@ def genHeatMap(
           feature['properties'][importanceFactorField] if importanceFactorField else 1,
           maxArea,
           maxSap,
-          area=rasterArea
+          area=rasterArea,
+          areaFloor=areaFloor
         )
     return 1 # count method
 
@@ -252,13 +265,15 @@ def genHeatMap(
         # Regular shapes will not have all_touched algorithm applied because all_touched causes some
         # line artifacts for larger shapes that are incorrect. Using only on small minimizes that affect
 
+        # Classify from vector geometry only (area / perimeter). Cell-area SAP and
+        # areaFloor are applied after this and must not change isSmall.
         if (geometry["type"] == "Polygon"):
-          polygonShapeIndex = calcPolygonShapeIndex(shapeGeom)
-          isSmall = allTouchedSmall and polygonShapeIndex < shapeIndexThreshold
+          isSmall = allTouchedSmall and calcPolygonShapeIndex(shapeGeom) < shapeIndexThreshold
           nCells = countRasterCells(shapeGeom, outTransform, width, height, all_touched=isSmall)
           heatValue = heatValueFromCellCount(nCells)
           if (isSmall):
             smallShapes.append((geometry, heatValue))
+            smallIncluded.append((uniqueId, heatValue))
           else:
             shapes.append((geometry, heatValue))
         elif (geometry["type"] == "MultiPolygon"):
@@ -268,8 +283,7 @@ def genHeatMap(
           parts = []
           totalN = 0
           for p in polys:
-            polygonShapeIndex = calcPolygonShapeIndex(p)
-            isSmall = allTouchedSmall and polygonShapeIndex < shapeIndexThreshold
+            isSmall = allTouchedSmall and calcPolygonShapeIndex(p) < shapeIndexThreshold
             totalN += countRasterCells(p, outTransform, width, height, all_touched=isSmall)
             parts.append((p, isSmall))
           heatValue = heatValueFromCellCount(totalN)
@@ -277,6 +291,7 @@ def genHeatMap(
           for p, isSmall in parts:
             if (isSmall):
               smallShapes.append((MultiPolygon([p]).__geo_interface__, heatValue))
+              smallIncluded.append((uniqueId, heatValue))
             else:
               shapes.append((p.__geo_interface__, heatValue))
 
@@ -374,11 +389,13 @@ def genHeatMap(
   ) as out:
     out.write(result, indexes=1)
 
+  manifest['included'] = [(uid, hv) for uid, hv in manifest['included']]
+  manifest['includedSmall'] = [(uid, hv) for uid, hv in smallIncluded]
   manifest['includedCount'] = len(manifest['included'])
   manifest['excludedCount'] = len(manifest['excluded'])
+  manifest['includedSmallCount'] = len(smallIncluded)
   manifest['executionTime'] = round(time.perf_counter() - startTime, 2)
   if allTouchedSmall:
-    manifest['includedSmallCount'] = len(smallShapes)
     manifest['allTouchedSmallFactor'] = allTouchedSmallFactor
     manifest['shapeIndexThreshold'] = shapeIndexThreshold
 
@@ -387,14 +404,16 @@ def genHeatMap(
   print(' {} features burned in'.format(manifest['includedCount']))
   if (allTouchedSmall):
     print(' allTouchedSmall enabled, numSmallShapes: {0}'.format(len(smallShapes)))
+    print(' includedSmall: {0}'.format(simplejson.dumps(manifest['includedSmall'])))
   if manifest['excludedCount'] > 0:
     print(' {} features excluded, see logfile for details'.format(manifest['excludedCount']))
   print('')
 
-  if manifestfile:
-    with open(manifestfile, 'w') as manifestFile:
-      simplejson.dump(manifest, manifestFile, indent=2)
-  else:
+  with open(manifestfile, 'w') as manifestFile:
+    simplejson.dump(manifest, manifestFile, indent=2)
+  print('Wrote manifest {}'.format(manifestfile))
+
+  if not logToFile:
       print('Manifest:')
       print(simplejson.dumps(manifest, indent=2))
       print('')
