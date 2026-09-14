@@ -6,7 +6,6 @@ from rasterio.enums import MergeAlg
 from rasterio.crs import CRS
 from rasterio.transform import Affine
 from rasterio.windows import from_bounds
-import rasterio.shutil
 from shapely.geometry import shape, box, Polygon, MultiPolygon
 import fiona
 import simplejson
@@ -287,7 +286,6 @@ def genHeatMap(
             totalN += countRasterCells(p, outTransform, width, height, all_touched=isSmall)
             parts.append((p, isSmall))
           heatValue = heatValueFromCellCount(totalN)
-          print('Splitting multipolygon {0} into {1} pieces and applying heat value {2} to each'.format(uniqueId, len(polys), heatValue))
           for p, isSmall in parts:
             if (isSmall):
               smallShapes.append((MultiPolygon([p]).__geo_interface__, heatValue))
@@ -312,21 +310,6 @@ def genHeatMap(
         fill=0,
         all_touched=True
     )
-    # Debug - output small shape raster
-    # if result is not None:
-    #   with rasterio.open(
-    #     outfileLarge,
-    #     'w',
-    #     driver='GTiff',
-    #     height=height,
-    #     width=width,
-    #     count=1,
-    #     nodata=0,
-    #     dtype='float32',
-    #     crs=outCrs,
-    #     transform=outTransform
-    #   ) as out:
-    #     out.write(result, indexes=1)
 
   if len(shapes) > 0:
     if result is not None and result.size > 0:
@@ -347,21 +330,6 @@ def genHeatMap(
         fill=0,
         all_touched=False
       )
-      # Debug - output small shape raster
-      # if result is not None:
-      #   with rasterio.open(
-      #     outfileLarge,
-      #     'w',
-      #     driver='GTiff',
-      #     height=height,
-      #     width=width,
-      #     count=1,
-      #     nodata=0,
-      #     dtype='float32',
-      #     crs=outCrs,
-      #     transform=outTransform
-      #   ) as out:
-      #     out.write(result, indexes=1)
 
   if logfile:
     with open(logfile, 'w') as logFile:
