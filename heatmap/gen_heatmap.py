@@ -95,7 +95,7 @@ def genHeatMap(
     maxArea: limits the area of a shape in SAP calculation after areaFactor. Gives shapes with high area an artificially lower one, increasing their SAP
     areaFloor: minimum overlapped cell area in square meters. Calculated areas below this are raised to the floor before areaFactor, decreasing their SAP. Does not affect allTouchedSmall classification, which uses vector shape index only.
     maxSap: limits the SAP value. Gives shapes with high priority an artificially lower one, decreasing their presence in heatmap
-    logToFile: (boolean) whether to write the .log.txt and .error.geojson and skip printing the full manifest to stdout. The .manifest.json is always written next to the output GeoTIFF.
+    logToFile: (boolean) whether to write the .log.txt and .error.geojson and skip printing the full info to stdout. The .info.json is always written to a logs/ directory alongside the output GeoTIFF. When logToFile is True, the log and error files are written to the same directory, overwriting any existing files with the same name.
 
   Returns:
     Manifest of run
@@ -118,21 +118,21 @@ def genHeatMap(
   # output files have the same name as infile
   inpath, inFullFilename = os.path.split(infile)
   inFilename = inFullFilename.split('.')[0]
+  outDir = inpath if outPath is None else outPath
+  if outPath is not None:
+    os.makedirs(outDir, exist_ok=True)
   # full path, minus extension
-  inBasename = ''
-
-  if outPath is None:
-    inBasename = os.path.join(inpath, inFilename)    
-  else:
-    os.makedirs(outPath, exist_ok=True)
-    inBasename = os.path.join(outPath, inFilename)
+  inBasename = os.path.join(outDir, inFilename)
 
   outfile = "{}.tif".format(inBasename)
   outfileSmall = "{}_small.tif".format(inBasename)
   outfileLarge = "{}_large.tif".format(inBasename)
-  logfile = "{}.log.txt".format(inBasename) if logToFile else None
-  manifestfile = "{}.manifest.json".format(inBasename)
-  errorfile = "{}.error.geojson".format(inBasename) if logToFile else None
+
+  logsDir = os.path.join(outDir, 'logs')
+  logBase = os.path.join(logsDir, inFilename)
+  infofile = "{}.info.json".format(logBase)
+  logfile = "{}.log.txt".format(logBase) if logToFile else None
+  errorfile = "{}.error.geojson".format(logBase) if logToFile else None
 
   if os.path.exists(outfile) and not overwrite:
     print('Warning: outfile {0} already exists, skipping. Remove it and re-run or use overwrite option'.format(outfile))
@@ -146,7 +146,7 @@ def genHeatMap(
       'infile': infile,
       'outfile': outfile,
       'logfile': logfile,
-      'manifestfile': manifestfile,
+      'infofile': infofile,
       'errorfile': errorfile,
       'importanceField': importanceField,
       'importanceFactorField': importanceFactorField,
@@ -156,6 +156,7 @@ def genHeatMap(
       'bounds': bounds,
       'boundsPrecision': boundsPrecision,
       'allTouchedSmall': allTouchedSmall,
+      'areaFactor': areaFactor,
       'maxArea': maxArea,
       'areaFloor': areaFloor,
       'maxSap': maxSap,
@@ -331,6 +332,8 @@ def genHeatMap(
         all_touched=False
       )
 
+  os.makedirs(logsDir, exist_ok=True)
+
   if logfile:
     with open(logfile, 'w') as logFile:
       for item in log:
@@ -377,14 +380,8 @@ def genHeatMap(
     print(' {} features excluded, see logfile for details'.format(manifest['excludedCount']))
   print('')
 
-  with open(manifestfile, 'w') as manifestFile:
-    simplejson.dump(manifest, manifestFile, indent=2)
-  print('Wrote manifest {}'.format(manifestfile))
-
-  if not logToFile:
-      print('Manifest:')
-      print(simplejson.dumps(manifest, indent=2))
-      print('')
+  with open(infofile, 'w') as infoFile:
+    simplejson.dump(manifest, infoFile, indent=2)
 
   if errorfile and len(error_shapes) > 0:
     with open(errorfile, 'w') as errorFile:
