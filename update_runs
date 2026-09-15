@@ -1,0 +1,76 @@
+#!.venv/bin/python
+"""Replace the runs list in a heatmap config.json from vector files in a directory.
+
+Usage: ./update_runs path/to/config.json path/to/vectors [glob]
+"""
+
+import argparse
+import glob
+import json
+import os
+import sys
+
+VECTOR_EXTS = ('.fgb', '.geojson', '.shp', '.gpkg')
+
+
+def is_vector_file(path):
+  return os.path.isfile(path) and os.path.splitext(path)[1].lower() in VECTOR_EXTS
+
+
+def find_vector_files(source_dir, pattern):
+  source_dir = os.path.abspath(os.path.expanduser(source_dir))
+  if pattern:
+    search = os.path.join(source_dir, pattern)
+    matches = glob.glob(search, recursive='**' in pattern)
+  else:
+    matches = [os.path.join(source_dir, name) for name in os.listdir(source_dir)]
+  files = sorted(os.path.abspath(path) for path in matches if is_vector_file(path))
+  return files
+
+
+def main():
+  parser = argparse.ArgumentParser(
+    description='Replace the runs list in a heatmap config.json from vector files in a directory.'
+  )
+  parser.add_argument('config', help='Path to config.json to update')
+  parser.add_argument('source_dir', help='Directory containing source vector files')
+  parser.add_argument(
+    'pattern',
+    nargs='?',
+    default=None,
+    help='Optional glob relative to source_dir (default: all vector files)'
+  )
+  args = parser.parse_args()
+
+  config_path = os.path.abspath(os.path.expanduser(args.config))
+  if not os.path.isfile(config_path):
+    sys.exit('Config not found: {}'.format(config_path))
+
+  source_dir = os.path.abspath(os.path.expanduser(args.source_dir))
+  if not os.path.isdir(source_dir):
+    sys.exit('Directory not found: {}'.format(source_dir))
+
+  files = find_vector_files(source_dir, args.pattern)
+  if not files:
+    if args.pattern:
+      sys.exit('No vector files matched {} in {}'.format(args.pattern, source_dir))
+    sys.exit('No vector files found in {}'.format(source_dir))
+
+  print('Found {} file(s):'.format(len(files)))
+  for path in files:
+    print('  {}'.format(path))
+
+  with open(config_path) as config_file:
+    config = json.load(config_file)
+
+  config['runs'] = [{'infile': path} for path in files]
+
+  with open(config_path, 'w') as config_file:
+    json.dump(config, config_file, indent=4)
+    config_file.write('\n')
+
+  print('Updated {} with {} run(s)'.format(config_path, len(files)))
+
+
+if __name__ == '__main__':
+  main()
