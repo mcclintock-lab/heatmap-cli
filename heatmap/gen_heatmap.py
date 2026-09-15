@@ -1,5 +1,6 @@
 import math
 import os
+import numpy as np
 import rasterio
 from rasterio.features import bounds, rasterize
 from rasterio.enums import MergeAlg
@@ -15,6 +16,7 @@ from .reprojectFeature import reprojectPolygon
 from .calc_raster_props import calcRasterProps
 from .calc_sap import calcSap
 from .shapeIndex import calcShapeIndex, calcPolygonShapeIndex
+from .progress import FeatureProgress, progress_write
 
 def countRasterCells(geometry, transform, width, height, all_touched=False):
   """Count output raster cells a geometry would cover under the given rasterize mode.
@@ -53,6 +55,17 @@ def countRasterCells(geometry, transform, width, height, all_touched=False):
   return int(mask.sum())
 
 
+def countInfileFeatures(infile):
+  """Return the feature count of a vector file, or 0 if it cannot be opened."""
+  if not infile:
+    return 0
+  try:
+    with fiona.open(infile) as src:
+      return len(src)
+  except (fiona.errors.DriverError, OSError, TypeError, ValueError):
+    return 0
+
+
 def genHeatMap(
   infile,
   outPath=None,
@@ -73,6 +86,7 @@ def genHeatMap(
   maxSap=None,
   areaFloor=None,
   logToFile=False,
+  progress=None,
 ):
   """Generates Spatial Access Priority (SAP) raster map given run configuration
 
@@ -96,6 +110,7 @@ def genHeatMap(
     areaFloor: minimum overlapped cell area in square meters. Calculated areas below this are raised to the floor before areaFactor, decreasing their SAP. Does not affect allTouchedSmall classification, which uses vector shape index only.
     maxSap: limits the SAP value. Gives shapes with high priority an artificially lower one, decreasing their presence in heatmap
     logToFile: (boolean) whether to write the .log.txt and .error.geojson and skip printing the full info to stdout. The .info.json is always written to a logs/ directory alongside the output GeoTIFF. When logToFile is True, the log and error files are written to the same directory, overwriting any existing files with the same name.
+    progress: optional FeatureProgress tracker. When running multiple files from the CLI, a shared tracker is passed so feature progress is counted against all vector files. If omitted, a bar is created for this run only.
 
   Returns:
     Manifest of run
@@ -105,11 +120,11 @@ def genHeatMap(
   try:
     src_shapes = fiona.open(infile)
   except (fiona.errors.DriverError):
-    print('Warning: infile not found, skipping {0}'.format(infile))
+    progress_write(progress, 'Warning: infile not found, skipping {0}'.format(infile))
     return None
 
   if len(src_shapes) < 1:
-    print('Warning: infile contains no features, skipping {0}'.format(infile))
+    progress_write(progress, 'Warning: infile contains no features, skipping {0}'.format(infile))
     return None
   
   outCrs = CRS.from_string(outCrsString)
@@ -135,10 +150,10 @@ def genHeatMap(
   errorfile = "{}.error.geojson".format(logBase) if logToFile else None
 
   if os.path.exists(outfile) and not overwrite:
-    print('Warning: outfile {0} already exists, skipping. Remove it and re-run or use overwrite option'.format(outfile))
+    progress_write(progress, 'Warning: outfile {0} already exists, skipping. Remove it and re-run or use overwrite option'.format(outfile))
+    if progress is not None:
+      progress.update(len(src_shapes))
     return None
-  elif os.path.exists(outfile) and overwrite:
-    print('Overwriting {0} '.format(outfile))
 
   manifest = {
     'timestamp': datetime.datetime.now().astimezone().isoformat(),
@@ -211,7 +226,13 @@ def genHeatMap(
         )
     return 1 # count method
 
-  for idx, feature in enumerate(src_shapes):
+  owns_progress = progress is None
+  if owns_progress:
+    progress = FeatureProgress(len(src_shapes))
+  progress.start(inFilename)
+
+  try:
+    for idx, feature in enumerate(src_shapes):
       # Convert to shapely Polygon/MultiPolygon with reproject if necessary
       shapeGeom = shape(feature['geometry']) if src_shapes.crs['init'] == outCrsString else reprojectPolygon(shape(feature['geometry']), src_shapes.crs['init'], outCrsString)
       # Get new geojson-like object from shape, we'll use it for lower level work later
@@ -301,31 +322,30 @@ def genHeatMap(
         log.append("")
         manifest['excluded'].append((uniqueId, heatValue))
 
+      progress.update(1)
+
+  finally:
+    progress.finish()
+
+  n_small = len(smallShapes) if (allTouchedSmall and len(smallShapes) > 0) else 0
+  n_large = len(shapes)
   result = None
-  if allTouchedSmall and len(smallShapes) > 0:
-    result = rasterize(
+  if n_small > 0 or n_large > 0:
+    progress_write(progress, 'Rasterizing {} ({} geoms)'.format(inFilename, n_small + n_large))
+    result = np.zeros((height, width), dtype='float32')
+    if n_small > 0:
+      rasterize(
         smallShapes,
-        out_shape=(height, width),
+        out=result,
         transform=outTransform,
         merge_alg=MergeAlg.add,
         fill=0,
         all_touched=True
-    )
-
-  if len(shapes) > 0:
-    if result is not None and result.size > 0:
-      result = result + rasterize(
-        shapes,
-        out_shape=(height, width),
-        transform=outTransform,
-        merge_alg=MergeAlg.add,
-        fill=0,
-        all_touched=False
       )
-    else:
-      result = rasterize(
+    if n_large > 0:
+      rasterize(
         shapes,
-        out_shape=(height, width),
+        out=result,
         transform=outTransform,
         merge_alg=MergeAlg.add,
         fill=0,
@@ -338,13 +358,10 @@ def genHeatMap(
     with open(logfile, 'w') as logFile:
       for item in log:
           logFile.write("%s\n" % item)
-  elif len(log) > 0:
-      print('Log:')
-      for item in log:
-        print(item)
-      print('')
-  print('')
 
+  if result is None:
+    result = np.zeros((height, width), dtype='float32')
+  progress_write(progress, 'Writing {}'.format(outfile))
   with rasterio.open(
     outfile,
     'w',
@@ -360,6 +377,12 @@ def genHeatMap(
   ) as out:
     out.write(result, indexes=1)
 
+  if not logfile and len(log) > 0:
+      progress_write(progress, 'Log:')
+      for item in log:
+        progress_write(progress, item)
+      progress_write(progress, '')
+
   manifest['included'] = [(uid, hv) for uid, hv in manifest['included']]
   manifest['includedSmall'] = [(uid, hv) for uid, hv in smallIncluded]
   manifest['includedCount'] = len(manifest['included'])
@@ -370,15 +393,14 @@ def genHeatMap(
     manifest['allTouchedSmallFactor'] = allTouchedSmallFactor
     manifest['shapeIndexThreshold'] = shapeIndexThreshold
 
-  print('Created SAP raster {} in {}s'.format(outfile, manifest['executionTime']))
+  progress_write(progress, 'Created SAP raster {} in {}s'.format(outfile, manifest['executionTime']))
 
-  print(' {} features burned in'.format(manifest['includedCount']))
+  progress_write(progress, ' {} features burned in'.format(manifest['includedCount']))
   if (allTouchedSmall):
-    print(' allTouchedSmall enabled, numSmallShapes: {0}'.format(len(smallShapes)))
-    print(' includedSmall: {0}'.format(simplejson.dumps(manifest['includedSmall'])))
+    progress_write(progress, ' allTouchedSmall enabled, numSmallShapes: {0}'.format(len(smallShapes)))
   if manifest['excludedCount'] > 0:
-    print(' {} features excluded, see logfile for details'.format(manifest['excludedCount']))
-  print('')
+    progress_write(progress, ' {} features excluded, see logfile for details'.format(manifest['excludedCount']))
+  progress_write(progress, '')
 
   with open(infofile, 'w') as infoFile:
     simplejson.dump(manifest, infoFile, indent=2)

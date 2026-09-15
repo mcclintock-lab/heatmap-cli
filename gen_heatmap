@@ -1,5 +1,6 @@
 #!.venv/bin/python
-from heatmap.gen_heatmap import genHeatMap
+from heatmap.gen_heatmap import genHeatMap, countInfileFeatures
+from heatmap.progress import FeatureProgress
 import os.path
 import sys
 import json
@@ -19,10 +20,16 @@ config = json.load(f)
 default = config['default'] if 'default' in config else {}
 runs = config['runs'] if 'runs' in config else [config]
 
+run_params = [{**default, **run} for run in runs]
+total_features = 0
+for params in run_params:
+  total_features += countInfileFeatures(params.get('infile'))
+
 tracemalloc.start()
 
-for run in runs:
-  genHeatMap(**{**default, **run})
+progress = FeatureProgress(total_features)
+for params in run_params:
+  genHeatMap(progress=progress, **params)
 
 print('Peak memory usage: {0} MB'.format(tracemalloc.get_traced_memory()[1]/1000000))
 tracemalloc.stop()
