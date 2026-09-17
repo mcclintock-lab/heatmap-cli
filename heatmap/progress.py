@@ -9,7 +9,7 @@ def create_progress(total, desc, unit='it', initial=0):
     unit=unit,
     initial=initial,
     file=sys.stderr,
-    ncols=120,
+    ncols=100,
     leave=False,
     smoothing=0.05,
     mininterval=0.1,

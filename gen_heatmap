@@ -1,8 +1,13 @@
 #!.venv/bin/python
+import sys
+if sys.version_info < (3, 12):
+  sys.exit(
+    'This tool needs Python 3.12+ (3.13 via uv). Run ./setup_venv first.'
+  )
+
 from heatmap.gen_heatmap import genHeatMap, countInfileFeatures
 from heatmap.progress import FeatureProgress
 import os.path
-import sys
 import json
 import tracemalloc
 
