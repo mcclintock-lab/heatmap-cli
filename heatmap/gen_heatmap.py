@@ -6,7 +6,7 @@ from rasterio.features import bounds, rasterize
 from rasterio.enums import MergeAlg
 from rasterio.crs import CRS
 from rasterio.transform import Affine
-from rasterio.windows import from_bounds
+from rasterio.windows import Window, from_bounds
 from shapely.geometry import shape, box, Polygon, MultiPolygon
 import fiona
 import simplejson
@@ -16,10 +16,16 @@ from .reprojectFeature import reprojectPolygon
 from .calc_raster_props import calcRasterProps
 from .calc_sap import calcSap
 from .shapeIndex import calcShapeIndex, calcPolygonShapeIndex
-from .progress import FeatureProgress, progress_write
+from .progress import RunProgress, progress_write
+
+RASTER_BATCH = 250
+WRITE_ROWS = 256
 
 def countRasterCells(geometry, transform, width, height, all_touched=False):
   """Count output raster cells a geometry would cover under the given rasterize mode.
+
+  Returns (cell count, window pixel count). The window size is the work measure
+  used to predict full-raster burn time.
 
   Uses a window clipped to the geometry bounds (padded by 1 pixel for ALL_TOUCHED
   edges) so counting does not allocate a full-size raster per shape.
@@ -41,7 +47,7 @@ def countRasterCells(geometry, transform, width, height, all_touched=False):
   win_height = row_end - row_off
   win_width = col_end - col_off
   if win_height <= 0 or win_width <= 0:
-    return 0
+    return 0, 0
 
   window_transform = transform * Affine.translation(col_off, row_off)
   mask = rasterize(
@@ -52,7 +58,7 @@ def countRasterCells(geometry, transform, width, height, all_touched=False):
     all_touched=all_touched,
     dtype='uint8'
   )
-  return int(mask.sum())
+  return int(mask.sum()), win_height * win_width
 
 
 def countInfileFeatures(infile):
@@ -64,6 +70,43 @@ def countInfileFeatures(infile):
       return len(src)
   except (fiona.errors.DriverError, OSError, TypeError, ValueError):
     return 0
+
+
+def burnShapes(shapes, out, transform, all_touched, on_batch):
+  """Rasterize geometries in batches so progress can advance during the burn."""
+  for offset in range(0, len(shapes), RASTER_BATCH):
+    batch = shapes[offset:offset + RASTER_BATCH]
+    rasterize(
+      batch,
+      out=out,
+      transform=transform,
+      merge_alg=MergeAlg.add,
+      fill=0,
+      all_touched=all_touched,
+    )
+    on_batch(len(batch))
+
+
+def writeRasterStrips(dataset, result, on_strip):
+  """Write a single-band array in full-width row strips."""
+  height, width = result.shape
+  row = 0
+  while row < height:
+    n = min(WRITE_ROWS, height - row)
+    dataset.write(
+      result[row:row + n, :],
+      indexes=1,
+      window=Window(0, row, width, n),
+    )
+    on_strip(n)
+    row += n
+
+
+def _skip_file(progress, infile, n_features=0):
+  if progress is None:
+    return
+  name = os.path.splitext(os.path.basename(infile or ''))[0]
+  progress.skip_file(name, n_features)
 
 
 def genHeatMap(
@@ -110,7 +153,7 @@ def genHeatMap(
     areaFloor: minimum overlapped cell area in square meters. Calculated areas below this are raised to the floor before areaFactor, decreasing their SAP. Does not affect allTouchedSmall classification, which uses vector shape index only.
     maxSap: limits the SAP value. Gives shapes with high priority an artificially lower one, decreasing their presence in heatmap
     logToFile: (boolean) whether to write the .log.txt and .error.geojson and skip printing the full info to stdout. The .info.json is always written to a logs/ directory alongside the output GeoTIFF. When logToFile is True, the log and error files are written to the same directory, overwriting any existing files with the same name.
-    progress: optional FeatureProgress tracker. When running multiple files from the CLI, a shared tracker is passed so feature progress is counted against all vector files. If omitted, a bar is created for this run only.
+    progress: optional RunProgress tracker. When running multiple files from the CLI, a shared tracker is passed so progress covers every vector file. If omitted, a tracker is created for this run only.
 
   Returns:
     Manifest of run
@@ -121,10 +164,12 @@ def genHeatMap(
     src_shapes = fiona.open(infile)
   except (fiona.errors.DriverError):
     progress_write(progress, 'Warning: infile not found, skipping {0}'.format(infile))
+    _skip_file(progress, infile, 0)
     return None
 
   if len(src_shapes) < 1:
     progress_write(progress, 'Warning: infile contains no features, skipping {0}'.format(infile))
+    _skip_file(progress, infile, 0)
     return None
   
   outCrs = CRS.from_string(outCrsString)
@@ -151,8 +196,7 @@ def genHeatMap(
 
   if os.path.exists(outfile) and not overwrite:
     progress_write(progress, 'Warning: outfile {0} already exists, skipping. Remove it and re-run or use overwrite option'.format(outfile))
-    if progress is not None:
-      progress.update(len(src_shapes))
+    _skip_file(progress, inFilename, len(src_shapes))
     return None
 
   manifest = {
@@ -228,8 +272,16 @@ def genHeatMap(
 
   owns_progress = progress is None
   if owns_progress:
-    progress = FeatureProgress(len(src_shapes))
-  progress.start(inFilename)
+    progress = RunProgress(len(src_shapes), 1)
+  progress.begin_file(inFilename, len(src_shapes), width, height)
+
+  def countOverlappedCells(geom, all_touched):
+    started = time.perf_counter()
+    n_cells, window_px = countRasterCells(
+      geom, outTransform, width, height, all_touched=all_touched
+    )
+    progress.note_count(window_px, time.perf_counter() - started)
+    return n_cells
 
   try:
     for idx, feature in enumerate(src_shapes):
@@ -290,7 +342,7 @@ def genHeatMap(
         # areaFloor are applied after this and must not change isSmall.
         if (geometry["type"] == "Polygon"):
           isSmall = allTouchedSmall and calcPolygonShapeIndex(shapeGeom) < shapeIndexThreshold
-          nCells = countRasterCells(shapeGeom, outTransform, width, height, all_touched=isSmall)
+          nCells = countOverlappedCells(shapeGeom, isSmall)
           heatValue = heatValueFromCellCount(nCells)
           if (isSmall):
             smallShapes.append((geometry, heatValue))
@@ -305,7 +357,7 @@ def genHeatMap(
           totalN = 0
           for p in polys:
             isSmall = allTouchedSmall and calcPolygonShapeIndex(p) < shapeIndexThreshold
-            totalN += countRasterCells(p, outTransform, width, height, all_touched=isSmall)
+            totalN += countOverlappedCells(p, isSmall)
             parts.append((p, isSmall))
           heatValue = heatValueFromCellCount(totalN)
           for p, isSmall in parts:
@@ -322,35 +374,24 @@ def genHeatMap(
         log.append("")
         manifest['excluded'].append((uniqueId, heatValue))
 
-      progress.update(1)
+      progress.update_features(1)
 
   finally:
-    progress.finish()
+    progress.end_features()
 
   n_small = len(smallShapes) if (allTouchedSmall and len(smallShapes) > 0) else 0
   n_large = len(shapes)
+  n_geoms = n_small + n_large
   result = None
-  if n_small > 0 or n_large > 0:
-    progress_write(progress, 'Rasterizing {} ({} geoms)'.format(inFilename, n_small + n_large))
+  if n_geoms > 0:
+    progress_write(progress, 'Rasterizing {} ({} geoms)'.format(inFilename, n_geoms))
+    progress.start_raster(n_geoms)
     result = np.zeros((height, width), dtype='float32')
     if n_small > 0:
-      rasterize(
-        smallShapes,
-        out=result,
-        transform=outTransform,
-        merge_alg=MergeAlg.add,
-        fill=0,
-        all_touched=True
-      )
+      burnShapes(smallShapes, result, outTransform, True, progress.update_raster)
     if n_large > 0:
-      rasterize(
-        shapes,
-        out=result,
-        transform=outTransform,
-        merge_alg=MergeAlg.add,
-        fill=0,
-        all_touched=False
-      )
+      burnShapes(shapes, result, outTransform, False, progress.update_raster)
+    progress.end_raster()
 
   os.makedirs(logsDir, exist_ok=True)
 
@@ -362,6 +403,7 @@ def genHeatMap(
   if result is None:
     result = np.zeros((height, width), dtype='float32')
   progress_write(progress, 'Writing {}'.format(outfile))
+  progress.start_write(height)
   with rasterio.open(
     outfile,
     'w',
@@ -375,7 +417,8 @@ def genHeatMap(
     transform=outTransform,
     compress='deflate'
   ) as out:
-    out.write(result, indexes=1)
+    writeRasterStrips(out, result, progress.update_write)
+  progress.end_write()
 
   if not logfile and len(log) > 0:
       progress_write(progress, 'Log:')
@@ -412,6 +455,9 @@ def genHeatMap(
         "features": error_shapes
       }))
 
+  progress.finish_file()
+  if owns_progress:
+    progress.close()
   return manifest
   
 

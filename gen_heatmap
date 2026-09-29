@@ -2,7 +2,7 @@
 import sys
 
 from heatmap.gen_heatmap import genHeatMap, countInfileFeatures
-from heatmap.progress import FeatureProgress
+from heatmap.progress import RunProgress
 import os.path
 import json
 import tracemalloc
@@ -33,9 +33,12 @@ for params in run_params:
 
 tracemalloc.start()
 
-progress = FeatureProgress(total_features)
-for params in run_params:
-  genHeatMap(progress=progress, **params)
+progress = RunProgress(total_features, len(run_params))
+try:
+  for params in run_params:
+    genHeatMap(progress=progress, **params)
+finally:
+  progress.close()
 
 print('Peak memory usage: {0} MB'.format(tracemalloc.get_traced_memory()[1]/1000000))
 tracemalloc.stop()
