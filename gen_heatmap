@@ -1,9 +1,5 @@
 #!.venv/bin/python
 import sys
-if sys.version_info < (3, 12):
-  sys.exit(
-    'This tool needs Python 3.12+ (3.13 via uv). Run ./setup_venv first.'
-  )
 
 from heatmap.gen_heatmap import genHeatMap, countInfileFeatures
 from heatmap.progress import FeatureProgress
@@ -11,12 +7,17 @@ import os.path
 import json
 import tracemalloc
 
-usage = "Usage: ./gen_heatmap path/to/config.json"
+usage = "\nYou need to supply gen_heatmap with a JSON config\n\nExample: ./gen_heatmap path/to/config.json\n"
 
 # Load config
-configPath = sys.argv[1]
+try:
+  configPath = sys.argv[1]
+except IndexError:
+  sys.exit(usage)
+
+# configPath = sys.argv[1]
 if not os.path.isfile(configPath):
-  raise usage
+  sys.exit(usage)
 
 f = open(configPath,)
 config = json.load(f)
