@@ -10,6 +10,11 @@ import json
 import os
 import sys
 
+if sys.version_info < (3, 12):
+  sys.exit(
+    'This tool needs Python 3.12+ (3.13 via uv). Run ./setup_venv first.'
+  )
+
 VECTOR_EXTS = ('.fgb', '.geojson', '.shp', '.gpkg')
 
 

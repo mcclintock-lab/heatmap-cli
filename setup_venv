@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Create ./.venv with the Python in .python-version (3.13) and install deps.
+# Requires uv: https://docs.astral.sh/uv/getting-started/installation/
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+if ! command -v uv >/dev/null 2>&1; then
+  cat >&2 <<EOF
+uv is required. Install it, then re-run ./setup_venv:
+
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  # or: brew install uv
+EOF
+  exit 1
+fi
+
+PREFERRED="$(tr -d '[:space:]' < .python-version)"
+PREFERRED="${PREFERRED:-3.13}"
+
+recreate=1
+if [[ -x .venv/bin/python ]]; then
+  if .venv/bin/python -c "import sys; raise SystemExit(0 if sys.version_info[:2] == tuple(int(p) for p in '${PREFERRED}'.split('.')[:2]) else 1)"; then
+    recreate=0
+  else
+    echo "Existing .venv is not Python ${PREFERRED}. Recreating..."
+  fi
+fi
+
+if [[ "$recreate" -eq 1 ]]; then
+  uv venv --python "$PREFERRED" --clear
+fi
+
+uv pip install -r requirements.txt
+
+cat <<EOF
+
+Ready. From this directory:
+
+  ./gen_heatmap path/to/config.json
+
+The scripts use .venv/bin/python via their shebang; you do not need to activate the venv.
+EOF
